@@ -7,6 +7,10 @@ use std::fmt;
 ))]
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::task::{Context, Poll};
 
 #[cfg(feature = "gzip")]
@@ -84,6 +88,7 @@ impl Accepts {
 /// The inner decoder may be constructed asynchronously.
 pub(crate) struct Decoder {
     inner: Inner,
+    size: Arc<AtomicUsize>,
 }
 
 #[cfg(any(
@@ -148,7 +153,7 @@ struct Pending(PeekableIoStream, DecoderType);
     feature = "deflate",
     feature = "blocking",
 ))]
-pub(crate) struct IoStream<B = ResponseBody>(B);
+pub(crate) struct IoStream<B = ResponseBody>(B, Arc<AtomicUsize>);
 
 #[cfg(any(
     feature = "gzip",
@@ -189,9 +194,10 @@ impl Decoder {
     /// A plain text decoder.
     ///
     /// This decoder will emit the underlying chunks as-is.
-    fn plain_text(body: ResponseBody) -> Decoder {
+    fn plain_text(body: ResponseBody, size: Arc<AtomicUsize>) -> Decoder {
         Decoder {
             inner: Inner::PlainText(body),
+            size,
         }
     }
 
@@ -199,14 +205,15 @@ impl Decoder {
     ///
     /// This decoder will buffer and decompress chunks that are gzipped.
     #[cfg(feature = "gzip")]
-    fn gzip(body: ResponseBody) -> Decoder {
+    fn gzip(body: ResponseBody, size: Arc<AtomicUsize>) -> Decoder {
         use futures_util::StreamExt;
 
         Decoder {
             inner: Inner::Pending(Box::pin(Pending(
-                IoStream(body).peekable(),
+                IoStream(body, Arc::clone(&size)).peekable(),
                 DecoderType::Gzip,
             ))),
+            size,
         }
     }
 
@@ -244,14 +251,15 @@ impl Decoder {
     ///
     /// This decoder will buffer and decompress chunks that are deflated.
     #[cfg(feature = "deflate")]
-    fn deflate(body: ResponseBody) -> Decoder {
+    fn deflate(body: ResponseBody, size: Arc<AtomicUsize>) -> Decoder {
         use futures_util::StreamExt;
 
         Decoder {
             inner: Inner::Pending(Box::pin(Pending(
-                IoStream(body).peekable(),
+                IoStream(body, Arc::clone(&size)).peekable(),
                 DecoderType::Deflate,
             ))),
+            size,
         }
     }
 
@@ -300,11 +308,12 @@ impl Decoder {
         _headers: &mut HeaderMap,
         body: ResponseBody,
         _accepts: Accepts,
+        size: Arc<AtomicUsize>,
     ) -> Decoder {
         #[cfg(feature = "gzip")]
         {
             if _accepts.gzip && Decoder::detect_encoding(_headers, "gzip") {
-                return Decoder::gzip(body);
+                return Decoder::gzip(body, size);
             }
         }
 
@@ -325,11 +334,11 @@ impl Decoder {
         #[cfg(feature = "deflate")]
         {
             if _accepts.deflate && Decoder::detect_encoding(_headers, "deflate") {
-                return Decoder::deflate(body);
+                return Decoder::deflate(body, size);
             }
         }
 
-        Decoder::plain_text(body)
+        Decoder::plain_text(body, size)
     }
 }
 
@@ -358,7 +367,12 @@ impl HttpBody for Decoder {
             },
             Inner::PlainText(ref mut body) => {
                 match futures_core::ready!(Pin::new(body).poll_frame(cx)) {
-                    Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            self.size.fetch_add(data.len(), Ordering::Relaxed);
+                        }
+                        Poll::Ready(Some(Ok(frame)))
+                    },
                     Some(Err(err)) => Poll::Ready(Some(Err(crate::error::decode(err)))),
                     None => Poll::Ready(None),
                 }
@@ -452,7 +466,10 @@ impl Future for Pending {
             None => return Poll::Ready(Ok(Inner::PlainText(empty()))),
         };
 
-        let _body = std::mem::replace(&mut self.0, IoStream(empty()).peekable());
+        let _body = std::mem::replace(
+            &mut self.0,
+            IoStream(empty(), Arc::new(AtomicUsize::new(0))).peekable(),
+        );
 
         match self.1 {
             #[cfg(feature = "brotli")]
@@ -499,6 +516,7 @@ where
                 Some(Ok(frame)) => {
                     // skip non-data frames
                     if let Ok(buf) = frame.into_data() {
+                        self.1.fetch_add(buf.len(), Ordering::Relaxed);
                         Poll::Ready(Some(Ok(buf)))
                     } else {
                         continue;
