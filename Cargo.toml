@@ -221,7 +221,7 @@ num_cpus = "1.0"
 libc = "0"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reqwest_unstable)'] }
+unexpected_cfgs = { level = "allow" }
 
 [[example]]
 name = "blocking"
