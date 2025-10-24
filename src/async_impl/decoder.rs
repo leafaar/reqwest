@@ -191,6 +191,7 @@ impl Decoder {
     pub(crate) fn empty() -> Decoder {
         Decoder {
             inner: Inner::PlainText(empty()),
+            size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
