@@ -197,7 +197,7 @@ impl Decoder {
 
     #[cfg(feature = "blocking")]
     pub(crate) fn into_stream(self) -> IoStream<Self> {
-        IoStream(self)
+        IoStream(self, Arc::new(AtomicUsize::new(0)))
     }
 
     /// A plain text decoder.
@@ -230,14 +230,15 @@ impl Decoder {
     ///
     /// This decoder will buffer and decompress chunks that are brotlied.
     #[cfg(feature = "brotli")]
-    fn brotli(body: ResponseBody) -> Decoder {
+    fn brotli(body: ResponseBody, size: Arc<AtomicUsize>) -> Decoder {
         use futures_util::StreamExt;
 
         Decoder {
             inner: Inner::Pending(Box::pin(Pending(
-                IoStream(body).peekable(),
+                IoStream(body, Arc::clone(&size)).peekable(),
                 DecoderType::Brotli,
             ))),
+            size,
         }
     }
 
@@ -245,14 +246,15 @@ impl Decoder {
     ///
     /// This decoder will buffer and decompress chunks that are zstd compressed.
     #[cfg(feature = "zstd")]
-    fn zstd(body: ResponseBody) -> Decoder {
+    fn zstd(body: ResponseBody, size: Arc<AtomicUsize>) -> Decoder {
         use futures_util::StreamExt;
 
         Decoder {
             inner: Inner::Pending(Box::pin(Pending(
-                IoStream(body).peekable(),
+                IoStream(body, Arc::clone(&size)).peekable(),
                 DecoderType::Zstd,
             ))),
+            size,
         }
     }
 
@@ -329,14 +331,14 @@ impl Decoder {
         #[cfg(feature = "brotli")]
         {
             if _accepts.brotli && Decoder::detect_encoding(_headers, "br") {
-                return Decoder::brotli(body);
+                return Decoder::brotli(body, size);
             }
         }
 
         #[cfg(feature = "zstd")]
         {
             if _accepts.zstd && Decoder::detect_encoding(_headers, "zstd") {
-                return Decoder::zstd(body);
+                return Decoder::zstd(body, size);
             }
         }
 
